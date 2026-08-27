@@ -3487,26 +3487,64 @@ async function startRandomDraw(n){
    - '전체 누적 오답': 지금까지 본 모든 시험 기록(examLogs)과 현재 미해결 오답(sd.wrong)을 합쳐서
      한 번이라도 틀렸던(그리고 아직 확실히 정리 안 된) 문제를 모두 포함 → 로그인/기기를 바꿔도,
      시간이 지나도 항상 똑같이 반영돼요. */
+async function fetchCloudWrongData(name){
+  /* 구글시트에 기록된 이 학생의 모든 응시 회차(다른 기기 포함)를 가져와,
+     시간순으로 마지막 결과가 정답이면 오답 목록에서 빼는 방식으로
+     '지금 시점 기준 진짜 오답'만 골라내요. GAS_URL이 없거나 네트워크에
+     실패하면 조용히 빈 결과를 돌려주고, 로컬 기록만으로 이어서 동작해요. */
+  if(!GAS_URL) return {wrongList:[], sessions:[]};
+  try{
+    const res=await fetch(`${GAS_URL}?action=detail&name=${encodeURIComponent(name)}&app=${encodeURIComponent(APP_LABEL)}`);
+    const json=await res.json();
+    if(!json.ok || !json.sessions) return {wrongList:[], sessions:[]};
+    const sessions=json.sessions;
+    const byTimeAsc=sessions.slice().sort((a,b)=>new Date(a.ts)-new Date(b.ts));
+    const wrongMap={};
+    byTimeAsc.forEach(s=>{
+      (s.detail||[]).forEach(d=>{
+        if(d.ok===false) wrongMap[d.id]={id:d.id, your:d.your};
+        else delete wrongMap[d.id];
+      });
+    });
+    return {wrongList:Object.values(wrongMap), sessions};
+  }catch(e){
+    return {wrongList:[], sessions:[]};
+  }
+}
 async function loadWrongPoolAndStart(){
   const {data:sd, failed}=await getStudentData(state.name);
   if(failed){
     await showAlert('오답 기록을 불러오지 못했어요. 브라우저 저장공간을 확인한 뒤 다시 시도해 주세요.');
     return;
   }
+  showLoading('오답 기록을 불러오고 있어요...');
+  const cloud=await fetchCloudWrongData(state.name);
+  hideLoading();
   let wn=[];
   if(state.wrongScope==='recent'){
     const logs=sd.examLogs||[];
-    if(logs.length===0){showAlert('아직 제출한 시험 기록이 없어요! 먼저 다른 모드로 시험을 한 번 봐 주세요.');return;}
-    const last=logs[logs.length-1];
-    wn=last.wrongList||[];
+    const localLast=logs.length?logs[logs.length-1]:null;
+    const cloudLast=cloud.sessions.length?cloud.sessions.slice().sort((a,b)=>new Date(b.ts)-new Date(a.ts))[0]:null;
+    const localTs=localLast?localLast.ts:0;
+    const cloudTs=cloudLast?new Date(cloudLast.ts).getTime():0;
+    if(!localLast && !cloudLast){
+      showAlert('아직 제출한 시험 기록이 없어요! 먼저 다른 모드로 시험을 한 번 봐 주세요.');
+      return;
+    }
+    if(cloudTs>localTs){
+      // 다른 기기에서 본 시험이 이 기기의 기록보다 더 최근이면 그쪽을 최근 시험으로 봐요.
+      wn=(cloudLast.detail||[]).filter(d=>d.ok===false).map(d=>({id:d.id, your:d.your}));
+    } else {
+      wn=localLast.wrongList||[];
+    }
     if(wn.length===0){showAlert('가장 최근 시험에서는 틀린 문제가 없었어요! 완벽했네요 🎉');return;}
   } else {
-    // sd.wrong(현재 미해결 오답) + 모든 시험 기록의 오답을 합쳐 한 번이라도 틀렸던 문제를 폭넓게 포함
+    // sd.wrong(현재 미해결 오답) + 모든 로컬 시험 기록의 오답 + 구글시트(다른 기기 포함)의 오답을 모두 합쳐요.
     const fromLogs=[];
     (sd.examLogs||[]).forEach(l=>{(l.wrongList||[]).forEach(w=>fromLogs.push(w));});
-    wn=[...(sd.wrong||[]), ...fromLogs];
+    wn=[...(sd.wrong||[]), ...fromLogs, ...cloud.wrongList];
     if(wn.length===0){
-      if((sd.examLogs||[]).length===0){
+      if((sd.examLogs||[]).length===0 && cloud.sessions.length===0){
         showAlert('아직 본 시험이 없어요! 먼저 다른 모드로 시험을 한 번 봐 주세요.');
       } else {
         showAlert('지금까지 틀렸던 문제를 모두 맞혔어요! 완벽해요 🎉');
